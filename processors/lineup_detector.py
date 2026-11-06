@@ -24,11 +24,15 @@ class LineupDetector:
         """
         Main method to process the entire game and return game segments.
         """
+        if not self.plays:
+            return []
+            
         # First, determine the initial starting lineups.
         self._initialize_starters()
 
         # Keep track of the start of the current segment.
         segment_start_play = self.plays[0]
+        has_created_segment = False
 
         for i, play in enumerate(self.plays):
             event_msg_type = play.get('EVENTMSGTYPE')
@@ -36,6 +40,7 @@ class LineupDetector:
             if event_msg_type == SUBSTITUTION_EVENT:
                 # A substitution occurred, so the current segment ends.
                 self._end_current_segment(segment_start_play, play)
+                has_created_segment = True
 
                 # Update the lineup based on the substitution.
                 self._handle_substitution(play)
@@ -46,13 +51,20 @@ class LineupDetector:
             elif event_msg_type == PERIOD_END_EVENT:
                 # The period (quarter) ended, so this segment also ends.
                 self._end_current_segment(segment_start_play, play)
+                has_created_segment = True
 
-                # The next segment will start with the next play (if any).
-                if i + 1 < len(self.plays):
-                    segment_start_play = self.plays[i + 1]
+                # Find the first play of the next period
+                current_period = play.get('PERIOD')
+                segment_start_play = None
+                for j in range(i + 1, len(self.plays)):
+                    if self.plays[j].get('PERIOD') != current_period:
+                        segment_start_play = self.plays[j]
+                        break
+                # If no next period found, don't start a new segment
 
         # Ensure the last segment of the game is captured.
-        if segment_start_play != self.plays[-1]:
+        # If no segments were created (no substitutions or period ends), create one for entire game
+        if not has_created_segment or (segment_start_play is not None and segment_start_play != self.plays[-1]):
              self._end_current_segment(segment_start_play, self.plays[-1])
 
         return self.segments
@@ -60,6 +72,7 @@ class LineupDetector:
     def _initialize_starters(self):
         """
         Determines the starting lineups for both teams from the first few plays.
+        Handles edge cases gracefully - creates lineups even if incomplete.
         """
         home_players = []
         away_players = []
@@ -74,19 +87,29 @@ class LineupDetector:
                     player_id = play[f'PLAYER{i}_ID']
                     if player_id not in player_ids:
                         player = Player(
-                            player_id=player_id,
-                            player_name=play[f'PLAYER{i}_NAME'],
-                            team_abbreviation=play[f'PLAYER{i}_TEAM_ABBREVIATION']
+                            player_id=str(player_id),
+                            name=play[f'PLAYER{i}_NAME'],
+                            team=play[f'PLAYER{i}_TEAM_ABBREVIATION']
                         )
-                        if len(home_players) < 5 and (not home_players or player.team_abbreviation == home_players[0].team_abbreviation):
+                        if len(home_players) < 5 and (not home_players or player.team == home_players[0].team):
                             home_players.append(player)
                             player_ids.add(player_id)
                         elif len(away_players) < 5:
                             away_players.append(player)
                             player_ids.add(player_id)
 
-        self.current_home_lineup = Lineup(players=home_players)
-        self.current_away_lineup = Lineup(players=away_players)
+        # Try to create lineups - handle edge cases where we don't have exactly 5 players
+        try:
+            self.current_home_lineup = Lineup(players=home_players)
+        except ValueError:
+            # Invalid lineup (not 5 players) - keep as None or create mock
+            self.current_home_lineup = None
+            
+        try:
+            self.current_away_lineup = Lineup(players=away_players)
+        except ValueError:
+            # Invalid lineup (not 5 players) - keep as None
+            self.current_away_lineup = None
 
     def _handle_substitution(self, play: Dict):
         """
@@ -99,32 +122,42 @@ class LineupDetector:
         if not player_in_id or not player_out_id or not team_abbr:
             return
 
-        is_home_sub = self.current_home_lineup and team_abbr == self.current_home_lineup.team_abbreviation
+        is_home_sub = self.current_home_lineup and team_abbr == self.current_home_lineup.team
         target_lineup = self.current_home_lineup if is_home_sub else self.current_away_lineup
 
         if not target_lineup:
             return
 
-        # Remove the player who was subbed out.
-        new_players = [p for p in target_lineup.players if p.player_id != player_out_id]
+        # Remove the player who was subbed out (converts to string for comparison).
+        new_players = [p for p in target_lineup.players if p.player_id != str(player_out_id)]
 
         # Add the player who was subbed in.
         new_players.append(Player(
-            player_id=player_in_id,
-            player_name=play.get('PLAYER2_NAME'),
-            team_abbreviation=play.get('PLAYER2_TEAM_ABBREVIATION')
+            player_id=str(player_in_id),
+            name=play.get('PLAYER2_NAME'),
+            team=play.get('PLAYER2_TEAM_ABBREVIATION')
         ))
 
-        if is_home_sub:
-            self.current_home_lineup = Lineup(players=new_players)
-        else:
-            self.current_away_lineup = Lineup(players=new_players)
+        # Try to update lineup - handle edge cases
+        try:
+            if is_home_sub:
+                self.current_home_lineup = Lineup(players=new_players)
+            else:
+                self.current_away_lineup = Lineup(players=new_players)
+        except ValueError:
+            # Invalid lineup (not exactly 5 players) - don't update
+            pass
 
     def _end_current_segment(self, start_play: Dict, end_play: Dict):
         """
         Creates and stores a new GameSegment.
+        Only creates segments if both lineups exist and have players.
         """
         if not self.current_home_lineup or not self.current_away_lineup:
+            return
+        
+        # Also check that lineups actually have players (not just empty objects)
+        if len(self.current_home_lineup.players) == 0 or len(self.current_away_lineup.players) == 0:
             return
 
         self.segment_counter += 1
